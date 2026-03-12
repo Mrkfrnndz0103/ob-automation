@@ -1,65 +1,76 @@
-# Render Deployment Runbook (No Blueprint) + Production Env Checklist
+# Render Deployment Runbook (Docker Required)
 
-## 1. What To Deploy
+## 1. Decision
 
-Deploy this repo as a **Render Web Service** (free tier), connected to GitHub.
+For this project, deployment **must use Docker**.
 
-Why web service (not cron/serverless):
-- This workflow is a long-running poller (`WF21_CONTINUOUS=true`).
-- It needs an always-running process with health endpoint (`/healthz`).
+Reason:
+- You require `WF21_SUMMARY_RENDER_MODE=pdf_png`.
+- `pdf_png` requires runtime binaries: `pdftoppm` or `magick`.
+- Docker guarantees these tools are always present in every deploy.
 
-## 2. Pre-Deploy Checks (Local)
+Implemented in repo:
+- `Dockerfile` installs `poppler-utils` (`pdftoppm`) and `imagemagick` (`magick`)
+- `.dockerignore` reduces build context and excludes secrets/logs
 
-Run once before pushing:
+## 2. Pre-Deploy (Local)
+
+Run before pushing:
 
 ```bash
 go test ./internal/wf21 -run "TestBuildSummarySnapshotTargets|TestBuildSummaryCaption|TestFormatSummarySyncTimestamp|TestSelectPendingZipFiles|TestParseDriveTimestamp"
 go build ./...
 ```
 
-## 3. Create Render Service (Manual, No Blueprint)
+Optional local container check:
 
-1. Push latest code to GitHub.
-2. In Render: `New` -> `Web Service` -> connect your GitHub repo.
-3. Use these settings:
-   - Runtime: `Go`
-   - Build Command: `go build -o wf21 ./cmd`
-   - Start Command: `./wf21`
-   - Auto Deploy: `On` (recommended)
-4. Health Check Path: `/healthz`
-5. Instance: Free tier
+```bash
+docker build -t wf21:local .
+docker run --rm wf21:local sh -lc "which pdftoppm && which magick"
+```
 
-## 4. Production Env Checklist (Important)
+## 3. Create Render Service (Docker, No Blueprint)
 
-Set these in Render environment variables.
+1. Push code to GitHub (including `Dockerfile`).
+2. In Render: `New` -> `Web Service` -> connect repo.
+3. Render will detect Docker automatically.
+4. Use:
+   - Environment: Docker
+   - Dockerfile Path: `./Dockerfile`
+   - Auto Deploy: `On`
+5. Health Check Path: `/healthz`
+6. Instance: Free tier
 
-### Required credentials
+Do not set Go build/start commands in Render for this setup.
 
-- `WF21_GOOGLE_CREDENTIALS_JSON` (recommended on Render), or file-based creds path if you handle file injection
+## 4. Required Environment Variables (Render)
+
+### Credentials
+
+- `WF21_GOOGLE_CREDENTIALS_JSON`
 - `WF21_R2_ACCOUNT_ID`
 - `WF21_R2_BUCKET`
 - `WF21_R2_ACCESS_KEY_ID`
 - `WF21_R2_SECRET_ACCESS_KEY`
 
-### Core workflow
+### Workflow core
 
 - `WF21_CONTINUOUS=true`
 - `WF21_POLL_INTERVAL_SECONDS=1`
 - `WF21_DRY_RUN=false`
 - `WF21_BOOTSTRAP_PROCESS_EXISTING=true`
 - `WF21_ENABLE_HEALTH_SERVER=true`
-- Do not hardcode `PORT`; Render injects it automatically (app reads `WF21_HEALTH_PORT` then `PORT`)
 
-### Strongly recommended for stability on Render
+Do not hardcode `PORT`; Render injects it.
 
-Use R2-backed state/lock/status (do **not** rely on local `data/*.json` in production):
+### State, status, lock (strongly recommended)
+
+Use R2-backed paths to survive restarts/redeploys:
 
 - `WF21_STATE_FILE=r2://wf21/state.json`
 - `WF21_STATUS_FILE=r2://wf21/status.json`
 - `WF21_LOCK_FILE=r2://wf21/lock.json`
 - `WF21_LOCK_STALE_AFTER_SECONDS=1200`
-
-Why: Render filesystem is ephemeral; local state loss can cause repeated imports after restart.
 
 ### Destination tabs
 
@@ -67,96 +78,70 @@ Why: Render filesystem is ephemeral; local state loss can cause repeated imports
 - `WF21_DESTINATION_TAB_PACKED_IN_ANOTHER_TO=packed_in_another_to`
 - `WF21_DESTINATION_TAB_NO_LHPACKING=no_lhpacking`
 
-### Summary send
+### Summary + SeaTalk
 
 - `WF21_SUMMARY_SEND_ENABLED=true`
 - `WF21_SUMMARY_SYNC_CELL=config!B1`
 - `WF21_SUMMARY_WAIT_SECONDS=8`
 - `WF21_SUMMARY_STABILITY_RUNS=3`
 - `WF21_SUMMARY_STABILITY_WAIT_SECONDS=1`
-- SeaTalk bot mode:
-  - `WF21_SUMMARY_SEATALK_MODE=bot`
-  - `WF21_SEATALK_APP_ID`
-  - `WF21_SEATALK_APP_SECRET`
-  - `WF21_SEATALK_GROUP_ID` (or `WF21_SEATALK_GROUP_IDS`)
+- `WF21_SUMMARY_SEATALK_MODE=bot`
+- `WF21_SEATALK_APP_ID`
+- `WF21_SEATALK_APP_SECRET`
+- `WF21_SEATALK_GROUP_ID` (or `WF21_SEATALK_GROUP_IDS`)
 
-### PDF renderer choice
+### Renderer (required by your decision)
 
-If you deploy with native Go runtime on Render free tier, safest is:
-- `WF21_SUMMARY_RENDER_MODE=styled`
+- `WF21_SUMMARY_RENDER_MODE=pdf_png`
+- `WF21_SUMMARY_PDF_CONVERTER=auto` (or `pdftoppm`)
 
-Reason:
-- `pdf_png` mode requires `pdftoppm` or `magick`.
-- If those binaries are unavailable, startup/config validation can fail.
+## 5. Verify Converter Availability On Render
 
-If you must use `pdf_png`, use a Docker deployment that explicitly installs Poppler/ImageMagick.
+Check Render logs after deploy. You should not see:
 
-## 5. UptimeRobot Setup
+- `WF21_SUMMARY_RENDER_MODE=pdf_png requires converter availability: ...`
 
-1. Create an HTTP(s) monitor.
-2. URL: `https://<your-render-service>.onrender.com/healthz`
+Optional one-time start probe:
+
+```bash
+sh -lc 'which pdftoppm; which magick; ./wf21'
+```
+
+Then revert to default Docker CMD.
+
+## 6. UptimeRobot Setup
+
+1. Create HTTP(s) monitor.
+2. URL: `https://<your-service>.onrender.com/healthz`
 3. Interval: `5 minutes` (free plan).
-4. Add alert contacts (email/Telegram/Slack as needed).
 
 Optional second monitor:
-- URL: `/status`
-- Use only if `WF21_STATUS_FILE` is configured.
+- `https://<your-service>.onrender.com/status`
 
-## 6. Post-Deploy Verification
+## 7. Post-Deploy Verification
 
-Check Render logs for:
+Expected logs:
 - `watch mode enabled poll_interval=1s`
 - `health server listening on ...`
-- no repeating `cycle error=...`
 
-Validate endpoints:
+Expected endpoints:
+- `/healthz` -> `ok`
+- `/status` -> JSON; when no new zip, `changed=false`
 
-```bash
-curl https://<service>.onrender.com/healthz
-curl https://<service>.onrender.com/status
-```
+## 8. Troubleshooting
 
-Expected:
-- `/healthz` returns `ok`
-- `/status` returns JSON with `changed=false` when no new ZIP exists
-
-## 6.1 Verify `pdftoppm` / `magick` On Render Host
-
-You cannot inspect Render host binaries locally; verify from Render deploy/runtime behavior:
-
-1. Set:
-   - `WF21_SUMMARY_RENDER_MODE=pdf_png`
-   - `WF21_SUMMARY_PDF_CONVERTER=auto` (or `pdftoppm` / `magick`)
-2. Deploy and check Render logs.
-3. If converter is missing, startup fails with config error similar to:
-   - `WF21_SUMMARY_RENDER_MODE=pdf_png requires converter availability: ...`
-
-Optional temporary Start Command probe (for one deploy):
-
-```bash
-sh -lc 'which pdftoppm || true; which magick || true; ./wf21'
-```
-
-Then revert Start Command back to:
-
-```bash
-./wf21
-```
-
-## 7. Troubleshooting Quick Notes
-
-- Re-import happens twice:
-  - Ensure only one running instance.
-  - Ensure lock is configured (`WF21_LOCK_FILE`).
-  - Ensure state is persisted on R2 (`WF21_STATE_FILE=r2://...`), not local disk.
-- Summary image not sent:
-  - Check summary stability settings.
+- Duplicate import:
+  - Ensure only one service instance.
+  - Ensure `WF21_LOCK_FILE` is set.
+  - Ensure state file uses `r2://...`, not local disk.
+- Summary send missing:
   - Check SeaTalk credentials/group IDs.
-  - If using `pdf_png`, verify converter binaries exist.
+  - Check summary stability settings.
+  - Check logs for `post-import warning`.
 
 ## Sources
 
-- Render Go deploy docs: https://render.com/docs/deploy-go
+- Render Docker deploy docs: https://render.com/docs/docker
 - Render health checks: https://render.com/docs/health-checks
 - Render free tier behavior: https://render.com/free
 - Render persistent disks: https://render.com/docs/disks

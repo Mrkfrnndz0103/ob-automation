@@ -1,0 +1,9 @@
+.git
+.gitignore
+.env
+data/
+docs/
+*.log
+*.out
+*.exe
+wf21-live-test.log
