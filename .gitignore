@@ -3,4 +3,5 @@ data/
 *.exe
 *.out
 *.log
-
+/cloud-run-job.env.yaml
+/docs/cloud-run-job.env.yaml

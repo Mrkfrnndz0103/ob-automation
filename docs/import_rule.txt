@@ -15,7 +15,7 @@ Where this is implemented:
 - State persistence after each processed file: internal/wf21/main.go (updates `state.*` then `saveState(...)`)
 
 Current .env values in this repo:
-- WF21_BOOTSTRAP_PROCESS_EXISTING=true
+- WF21_BOOTSTRAP_PROCESS_EXISTING=false
   - Meaning: on first run with no existing state, the latest zip is processed immediately.
 - WF21_STATE_FILE=r2://wf21/state.json
   - Meaning: processed-file memory is stored in R2, shared across instances.

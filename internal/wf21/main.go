@@ -492,10 +492,20 @@ func runCycle(
 		lastProcessedCycle processResult
 	)
 	for i, file := range pending {
+		logger.Printf(
+			"ongoing processing cycle=%d file=%d/%d file_id=%s file_name=%q modified=%s",
+			cycle,
+			i+1,
+			len(pending),
+			file.ID,
+			file.Name,
+			file.ModifiedTime.Format(time.RFC3339),
+		)
 		zipPath, downloadErr := downloadDriveFileToTemp(ctx, driveSvc, file.ID, cfg.TempDir)
 		if downloadErr != nil {
 			return fmt.Errorf("download zip %s: %w", file.ID, downloadErr)
 		}
+		logger.Printf("ongoing processing downloaded file_id=%s temp_zip=%s", file.ID, zipPath)
 
 		sendSummaryAfterImport := i == len(pending)-1
 		result, processErr := processZipAndImport(
@@ -503,6 +513,7 @@ func runCycle(
 			cfg,
 			sheetsSvc,
 			r2Client,
+			logger,
 			file,
 			zipPath,
 			sendSummaryAfterImport,
@@ -557,6 +568,15 @@ func runCycle(
 			result.SummaryImageBytes,
 			cfg.DryRun,
 		)
+		logger.Printf(
+			"Done processing cycle=%d file=%d/%d file_id=%s file_name=%q destination_synced=%t",
+			cycle,
+			i+1,
+			len(pending),
+			file.ID,
+			file.Name,
+			result.DestinationSynced,
+		)
 		if strings.TrimSpace(result.PostImportWarning) != "" {
 			logger.Printf("post-import warning file_id=%s file_name=%q warning=%s", file.ID, file.Name, result.PostImportWarning)
 		}
@@ -578,6 +598,7 @@ func runCycle(
 	status.SummaryImageBytes = lastProcessedCycle.SummaryImageBytes
 	status.Message = fmt.Sprintf("processed %d new zip file(s)", len(pending))
 	writeStatusIfConfigured(ctx, r2Client, cfg, cfg.StatusFile, status, logger)
+	logger.Printf("Done cycle=%d processed=%d file(s)", cycle, len(pending))
 	return nil
 }
 
@@ -586,6 +607,7 @@ func processZipAndImport(
 	cfg workflowConfig,
 	sheetsSvc *sheets.Service,
 	r2Client *s3.Client,
+	logger *log.Logger,
 	file driveZipFile,
 	zipPath string,
 	sendSummaryAfterImport bool,
@@ -602,6 +624,9 @@ func processZipAndImport(
 	zipStat, err := zipFile.Stat()
 	if err != nil {
 		return result, err
+	}
+	if logger != nil {
+		logger.Printf("ongoing processing open_zip file_id=%s file_name=%q zip_bytes=%d", file.ID, file.Name, zipStat.Size())
 	}
 
 	reader, err := zip.NewReader(zipFile, zipStat.Size())
@@ -623,6 +648,9 @@ func processZipAndImport(
 	})
 	if len(csvFiles) == 0 {
 		return result, errors.New("zip contains no csv files")
+	}
+	if logger != nil {
+		logger.Printf("ongoing processing csv_files_found file_id=%s csv_files=%d", file.ID, len(csvFiles))
 	}
 
 	consolidatedFile, err := os.CreateTemp(cfg.TempDir, "wf21-consolidated-*.csv")
@@ -651,7 +679,16 @@ func processZipAndImport(
 	packedAnotherTORows := make([][]string, 0, cfg.SheetsBatchSize)
 	noLHPackingRows := make([][]string, 0, cfg.SheetsBatchSize)
 
-	for _, entry := range csvFiles {
+	for csvIdx, entry := range csvFiles {
+		if logger != nil {
+			logger.Printf(
+				"ongoing processing csv_read_start file_id=%s csv=%d/%d csv_name=%q",
+				file.ID,
+				csvIdx+1,
+				len(csvFiles),
+				entry.Name,
+			)
+		}
 		entryReader, openErr := entry.Open()
 		if openErr != nil {
 			return result, fmt.Errorf("open csv %q: %w", entry.Name, openErr)
@@ -762,6 +799,16 @@ func processZipAndImport(
 		}
 		entryReader.Close()
 		result.CSVFilesProcessed++
+		if logger != nil {
+			logger.Printf(
+				"ongoing processing csv_read_done file_id=%s csv=%d/%d rows_consolidated=%d rows_import_candidates=%d",
+				file.ID,
+				csvIdx+1,
+				len(csvFiles),
+				result.RowsConsolidated,
+				result.RowsImported,
+			)
+		}
 	}
 
 	if canonicalHeader == nil {
@@ -780,6 +827,15 @@ func processZipAndImport(
 	}
 
 	if !cfg.DryRun {
+		if logger != nil {
+			logger.Printf(
+				"ongoing import prepare file_id=%s rows_pending_rcv=%d rows_packed_in_another_to=%d rows_no_lhpacking=%d",
+				file.ID,
+				len(pendingRCVRows),
+				len(packedAnotherTORows),
+				len(noLHPackingRows),
+			)
+		}
 		snapshotHash, hashErr := buildDestinationSnapshotHash(
 			pendingRCVRows,
 			packedAnotherTORows,
@@ -791,6 +847,10 @@ func processZipAndImport(
 		result.DestinationSyncHash = snapshotHash
 		if snapshotHash != "" && strings.TrimSpace(snapshotHash) == strings.TrimSpace(lastDestinationSyncHash) {
 			result.DestinationSynced = false
+			if logger != nil {
+				logger.Printf("ongoing import skipped file_id=%s reason=destination_snapshot_unchanged", file.ID)
+				logger.Printf("Done import file_id=%s destination_synced=false reason=destination_snapshot_unchanged", file.ID)
+			}
 		} else {
 			importTabStates := []destinationImportTabState{
 				{
@@ -811,6 +871,9 @@ func processZipAndImport(
 			}
 			for i := range importTabStates {
 				tabState := &importTabStates[i]
+				if logger != nil {
+					logger.Printf("ongoing import tab_prepare_start file_id=%s tab=%q", file.ID, tabState.Name)
+				}
 				if err = loadSheetGridState(ctx, sheetsSvc, cfg.DestinationSheetID, tabState.Name, &tabState.GridState); err != nil {
 					return result, err
 				}
@@ -820,20 +883,27 @@ func processZipAndImport(
 				if err = writeHeaderRow(ctx, sheetsSvc, cfg, cfg.DestinationSheetID, tabState.Name, selectedOutputHeaders); err != nil {
 					return result, err
 				}
+				if logger != nil {
+					logger.Printf("ongoing import tab_prepare_done file_id=%s tab=%q", file.ID, tabState.Name)
+				}
 			}
 
 			// Import order: pending_rcv -> packed_in_another_to -> no_lhpacking.
 			// Summary sync/snapshot happens only after all destination tabs finish.
-			if err = importRowsToDestinationTab(ctx, sheetsSvc, cfg, cfg.DestinationSheetID, &importTabStates[0], pendingRCVRows); err != nil {
+			if err = importRowsToDestinationTab(ctx, sheetsSvc, cfg, cfg.DestinationSheetID, &importTabStates[0], pendingRCVRows, logger); err != nil {
 				return result, err
 			}
-			if err = importRowsToDestinationTab(ctx, sheetsSvc, cfg, cfg.DestinationSheetID, &importTabStates[1], packedAnotherTORows); err != nil {
+			if err = importRowsToDestinationTab(ctx, sheetsSvc, cfg, cfg.DestinationSheetID, &importTabStates[1], packedAnotherTORows, logger); err != nil {
 				return result, err
 			}
-			if err = importRowsToDestinationTab(ctx, sheetsSvc, cfg, cfg.DestinationSheetID, &importTabStates[2], noLHPackingRows); err != nil {
+			if err = importRowsToDestinationTab(ctx, sheetsSvc, cfg, cfg.DestinationSheetID, &importTabStates[2], noLHPackingRows, logger); err != nil {
 				return result, err
 			}
 			result.DestinationSynced = true
+			if logger != nil {
+				logger.Printf("ongoing import done file_id=%s destination_synced=true", file.ID)
+				logger.Printf("Done import file_id=%s destination_synced=true", file.ID)
+			}
 
 			// Post-import sync/send should not re-trigger destination re-imports on transient failures.
 			if syncErr := updateSummarySyncCell(ctx, cfg, sheetsSvc); syncErr != nil {
@@ -869,6 +939,9 @@ func processZipAndImport(
 	result.ObjectKey = objectKey
 
 	if !cfg.DryRun {
+		if logger != nil {
+			logger.Printf("ongoing processing upload_start file_id=%s object_key=%q", file.ID, objectKey)
+		}
 		if _, err = consolidatedFile.Seek(0, io.SeekStart); err != nil {
 			return result, err
 		}
@@ -881,6 +954,9 @@ func processZipAndImport(
 			} else {
 				return result, err
 			}
+		}
+		if logger != nil {
+			logger.Printf("ongoing processing upload_done file_id=%s object_key=%q bytes=%d", file.ID, objectKey, result.ObjectBytes)
 		}
 	}
 
@@ -1738,20 +1814,40 @@ func importRowsToDestinationTab(
 	sheetID string,
 	tabState *destinationImportTabState,
 	rows [][]string,
+	logger *log.Logger,
 ) error {
 	if tabState == nil || len(rows) == 0 {
+		if logger != nil && tabState != nil {
+			logger.Printf("ongoing import tab=%q skipped reason=no_rows", tabState.Name)
+		}
 		return nil
 	}
 	batchSize := maxInt(cfg.SheetsBatchSize, 1)
+	totalBatches := (len(rows) + batchSize - 1) / batchSize
 	batchStates := []destinationImportTabState{*tabState}
-	for start := 0; start < len(rows); start += batchSize {
+	for batchNum, start := 1, 0; start < len(rows); batchNum, start = batchNum+1, start+batchSize {
 		end := minInt(start+batchSize, len(rows))
+		startRow := batchStates[0].NextSheetRow
 		batchStates[0].PendingRows = rows[start:end]
+		if logger != nil {
+			logger.Printf(
+				"ongoing import tab=%q batch=%d/%d rows=%d start_row=%d",
+				batchStates[0].Name,
+				batchNum,
+				totalBatches,
+				end-start,
+				startRow,
+			)
+		}
 		if err := flushDestinationTabsRows(ctx, sheetsSvc, cfg, sheetID, batchStates); err != nil {
 			return err
 		}
 	}
 	*tabState = batchStates[0]
+	if logger != nil {
+		logger.Printf("ongoing import tab=%q completed rows=%d batches=%d", tabState.Name, len(rows), totalBatches)
+		logger.Printf("Done import tab=%q rows=%d batches=%d", tabState.Name, len(rows), totalBatches)
+	}
 	return nil
 }
 

@@ -123,6 +123,10 @@ Optional second monitor:
 Expected logs:
 - `watch mode enabled poll_interval=1s`
 - `health server listening on ...`
+- `ongoing processing cycle=... file=.../... file_id=...`
+- `ongoing import tab=... batch=.../... rows=...`
+- `Done import file_id=... destination_synced=...`
+- `Done processing cycle=... file=.../... file_id=...`
 
 Expected endpoints:
 - `/healthz` -> `ok`
