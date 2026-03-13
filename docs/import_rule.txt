@@ -1,0 +1,31 @@
+Import only once in this project is a WF2.1 file-processing rule, not a Go import syntax rule.
+
+In plain English:
+- The workflow remembers the last processed zip in state:
+  - LastProcessedFileID
+  - LastProcessedFileMD5
+  - LastProcessedModifiedTime
+- On each poll, it selects only pending/new zip files after that cursor.
+- If nothing is new, it skips import.
+
+Where this is implemented:
+- Baseline/first-run behavior (when bootstrap is disabled): internal/wf21/main.go (runCycle, `if !stateExists && !cfg.BootstrapProcessExisting`)
+- New file decision by Drive file ID: internal/wf21/main.go (`shouldProcessFile`)
+- Pending zip selection from state cursor: internal/wf21/main.go (`selectPendingZipFiles`)
+- State persistence after each processed file: internal/wf21/main.go (updates `state.*` then `saveState(...)`)
+
+Current .env values in this repo:
+- WF21_BOOTSTRAP_PROCESS_EXISTING=true
+  - Meaning: on first run with no existing state, the latest zip is processed immediately.
+- WF21_STATE_FILE=r2://wf21/state.json
+  - Meaning: processed-file memory is stored in R2, shared across instances.
+- WF21_LOCK_FILE=r2://wf21/lock.json
+  - Meaning: lock coordination helps prevent duplicate processing from multiple instances.
+
+Extra guard:
+- Even when a zip is processed, destination sheet sync is skipped if the computed destination snapshot hash is unchanged.
+- Implemented in internal/wf21/main.go (`buildDestinationSnapshotHash` and the `snapshotHash == lastDestinationSyncHash` check).
+
+Notes:
+- This rule is effectively "import once per new Drive file ID".
+- Editing/replacing content of an already-processed file with the same Drive ID is intentionally ignored by this logic.
